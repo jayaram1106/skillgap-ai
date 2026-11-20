@@ -1,12 +1,13 @@
 """
 SkillGap AI - FastAPI Backend Application.
 
-Provides endpoints for health verification and AI/heuristic resume-versus-job-description
-gap analysis using PyMuPDF and whole-word regex skill matching.
+Provides endpoints for health verification, AI/heuristic resume-versus-job-description
+gap analysis using PyMuPDF, whole-word regex skill matching, and SQLite persistence.
 """
 
 import os
 import sys
+from contextlib import asynccontextmanager
 from typing import List, Optional, Dict, Any
 
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, status
@@ -26,14 +27,33 @@ from analyzer import (
     MAX_FILE_SIZE_BYTES,
 )
 
+from db import (
+    init_db,
+    create_analysis_session,
+    get_analysis_session,
+    list_analysis_sessions,
+    save_user_preferences,
+    get_user_preferences,
+    is_valid_uuid,
+)
+
+
 # ---------------------------------------------------------------------------
-# FastAPI App Initialization (Preserved from existing setup)
+# FastAPI App Lifecycle & Initialization
 # ---------------------------------------------------------------------------
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Initialize database tables and WAL mode on application startup."""
+    init_db()
+    yield
+
 
 app = FastAPI(
     title="SkillGap AI API",
     description="Resume vs Job Description Gap Analyser",
-    version="1.0.0"
+    version="1.0.0",
+    lifespan=lifespan,
 )
 
 # Allow React frontend to communicate with backend
@@ -54,7 +74,7 @@ app.add_middleware(
 
 
 # ---------------------------------------------------------------------------
-# Response Models for Swagger UI Documentation (/docs)
+# Response & Request Models for Swagger UI Documentation (/docs)
 # ---------------------------------------------------------------------------
 
 class SkillEvidenceItem(BaseModel):
@@ -83,6 +103,7 @@ class EvidenceReport(BaseModel):
 
 class AnalyzeResponse(BaseModel):
     success: bool = Field(True, description="Whether the analysis succeeded")
+    session_id: str = Field(..., description="Unique database UUID for this analysis session")
     match_percentage: float = Field(..., description="Compatibility score ((matched / required) * 100)")
     summary: str = Field(..., description="Human-readable assessment and alignment overview")
     required_skills: List[str] = Field(..., description="All technical skills detected in the job description")
@@ -93,6 +114,14 @@ class AnalyzeResponse(BaseModel):
     resume_only_skills: List[str] = Field(..., description="Alias for additional_skills")
     evidence: EvidenceReport = Field(..., description="Contextual text snippets for detected and missing skills")
     score_explanation: str = Field(..., description="Detailed explanation of how the score is calculated")
+
+
+class PreferencesRequest(BaseModel):
+    weekly_hours: int = Field(10, ge=1, le=168, description="Target study hours per week")
+    skill_level: str = Field("intermediate", description="beginner | intermediate | advanced")
+    learning_style: str = Field("hands_on", description="hands_on | video_first | reading_docs | project_based")
+    target_timeline_weeks: Optional[int] = Field(None, ge=1, description="Optional target weeks")
+    user_id: Optional[str] = Field(None, description="Optional user account UUID")
 
 
 # ---------------------------------------------------------------------------
@@ -117,7 +146,7 @@ def health_check():
 
 
 # ---------------------------------------------------------------------------
-# POST /api/analyze Endpoint
+# POST /api/analyze Endpoint (Preserved & Enhanced with Session Persistence)
 # ---------------------------------------------------------------------------
 
 @app.post(
@@ -126,7 +155,7 @@ def health_check():
     summary="Analyze Resume vs Job Description Gap",
     description=(
         "Upload a PDF resume and job description text to extract skills, compute transparent "
-        "compatibility score, identify missing skills, and provide context snippets."
+        "compatibility score, identify missing skills, provide context snippets, and persist session."
     ),
 )
 async def analyze_resume_vs_job(
@@ -137,10 +166,11 @@ async def analyze_resume_vs_job(
     Analyzes an uploaded PDF resume against a job description.
 
     1. Validates PDF format, signature, size limit (5 MB), and page count (max 10).
-    2. Extracts plain text with PyMuPDF (fitz) without logging candidate PII.
+    2. Extracts plain text with PyMuPDF (fitz) in-memory without logging candidate PII.
     3. Normalizes technical skills to canonical names via a curated dictionary.
     4. Computes matched, missing, and additional skills with context snippets.
     5. Calculates transparent match score: (matched / required) * 100.
+    6. Persists session metadata, score, and skill names in SQLite (without storing PDF or resume text).
     """
     # 1. Validate file extension
     filename = resume.filename or ""
@@ -160,9 +190,8 @@ async def analyze_resume_vs_job(
             detail=f"Invalid MIME type '{resume.content_type}'. Expected 'application/pdf'.",
         )
 
-    # 3. Read file stream safely up to 5 MB + small buffer to detect overflow
+    # 3. Read file stream safely up to 5 MB
     try:
-        # Read in chunks to avoid unbounded memory spikes
         pdf_bytes = bytearray()
         chunk_size = 1024 * 1024  # 1 MB chunk
         while True:
@@ -197,15 +226,171 @@ async def analyze_resume_vs_job(
     # 5. Perform skill gap analysis
     try:
         result = analyze_gap(resume_text, job_description)
-        return result
     except JobDescriptionValidationError as e:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=str(e),
         )
     except Exception as e:
-        # Do not expose internal error or log PII
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="An unexpected error occurred while analyzing the documents. Please try again.",
         ) from e
+
+    # 6. Persist analysis session to SQLite (Strict privacy: NO raw resume text or PDFs stored)
+    try:
+        session_id = create_analysis_session(
+            match_percentage=result["match_percentage"],
+            summary=result["summary"],
+            required_skills=result["required_skills"],
+            resume_skills=result["resume_skills"],
+            matched_skills=result["matched_skills"],
+            missing_skills=result["missing_skills"],
+            additional_skills=result["additional_skills"],
+            score_explanation=result["score_explanation"],
+            job_description_snippet=job_description,
+        )
+        result["session_id"] = session_id
+        return result
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Analysis succeeded but failed to persist session record.",
+        ) from e
+
+
+# ---------------------------------------------------------------------------
+# Sessions & Preferences Endpoints
+# ---------------------------------------------------------------------------
+
+@app.get(
+    "/api/sessions/{session_id}",
+    summary="Retrieve Analysis Session",
+    description="Retrieve a previously saved analysis session by its UUID."
+)
+def get_session_by_id(session_id: str):
+    """Retrieve saved analysis session and any optional user preferences."""
+    if not is_valid_uuid(session_id):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid session UUID format: '{session_id}'."
+        )
+
+    session = get_analysis_session(session_id)
+    if not session:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Analysis session '{session_id}' was not found."
+        )
+
+    preferences = get_user_preferences(session_id)
+    return {
+        "success": True,
+        "session": session,
+        "preferences": preferences,
+    }
+
+
+@app.get(
+    "/api/sessions",
+    summary="List Recent Analysis Sessions",
+    description="List recent analysis sessions sorted by newest first."
+)
+def list_sessions(limit: int = 20, offset: int = 0):
+    """List recent analysis sessions."""
+    if limit < 1 or limit > 100:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Limit must be between 1 and 100."
+        )
+    if offset < 0:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Offset must be non-negative."
+        )
+
+    sessions = list_analysis_sessions(limit=limit, offset=offset)
+    return {
+        "success": True,
+        "count": len(sessions),
+        "sessions": sessions,
+    }
+
+
+@app.post(
+    "/api/sessions/{session_id}/preferences",
+    summary="Save User Learning Preferences",
+    description="Save or update learning preferences for an analysis session."
+)
+def update_preferences(session_id: str, payload: PreferencesRequest):
+    """Save or update user learning preferences for an analysis session."""
+    if not is_valid_uuid(session_id):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid session UUID format: '{session_id}'."
+        )
+
+    # Verify session exists
+    session = get_analysis_session(session_id)
+    if not session:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Analysis session '{session_id}' was not found."
+        )
+
+    valid_levels = {"beginner", "intermediate", "advanced"}
+    if payload.skill_level not in valid_levels:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid skill_level '{payload.skill_level}'. Choose from {sorted(list(valid_levels))}."
+        )
+
+    valid_styles = {"hands_on", "video_first", "reading_docs", "project_based"}
+    if payload.learning_style not in valid_styles:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid learning_style '{payload.learning_style}'. Choose from {sorted(list(valid_styles))}."
+        )
+
+    prefs = save_user_preferences(
+        session_id=session_id,
+        weekly_hours=payload.weekly_hours,
+        skill_level=payload.skill_level,
+        learning_style=payload.learning_style,
+        target_timeline_weeks=payload.target_timeline_weeks,
+        user_id=payload.user_id,
+    )
+
+    return {
+        "success": True,
+        "session_id": session_id,
+        "preferences": prefs,
+    }
+
+
+@app.get(
+    "/api/sessions/{session_id}/preferences",
+    summary="Get User Learning Preferences",
+    description="Get user learning preferences for an analysis session."
+)
+def retrieve_preferences(session_id: str):
+    """Retrieve learning preferences for an analysis session."""
+    if not is_valid_uuid(session_id):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid session UUID format: '{session_id}'."
+        )
+
+    session = get_analysis_session(session_id)
+    if not session:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Analysis session '{session_id}' was not found."
+        )
+
+    prefs = get_user_preferences(session_id)
+    return {
+        "success": True,
+        "session_id": session_id,
+        "preferences": prefs,
+    }

@@ -35,4 +35,9 @@ Thumbs.db
 # Local databases and uploaded files
 *.db
 *.sqlite3
+*.db-wal
+*.db-shm
+backend/db/skillgap.db
+backend/db/skillgap.db-wal
+backend/db/skillgap.db-shm
 uploads/
