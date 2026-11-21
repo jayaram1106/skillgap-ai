@@ -1,8 +1,11 @@
 """
 SkillGap AI - FastAPI Backend Application.
 
-Provides endpoints for health verification, AI/heuristic resume-versus-job-description
-gap analysis using PyMuPDF, whole-word regex skill matching, and SQLite persistence.
+Provides endpoints for:
+1. Health verification and status checks.
+2. Resume-versus-job-description gap analysis using PyMuPDF and regex skill extraction.
+3. SQLite persistence for analysis sessions and user learning preferences.
+4. Adaptive roadmap generation and progress tracking.
 """
 
 import os
@@ -27,6 +30,8 @@ from analyzer import (
     MAX_FILE_SIZE_BYTES,
 )
 
+from skills_data import get_skill_definitions
+
 from db import (
     init_db,
     create_analysis_session,
@@ -34,8 +39,15 @@ from db import (
     list_analysis_sessions,
     save_user_preferences,
     get_user_preferences,
+    create_learning_roadmap,
+    get_learning_roadmap_by_session,
+    get_roadmap_task_by_id,
+    update_roadmap_task,
+    get_roadmap_progress,
     is_valid_uuid,
 )
+
+from roadmap import generate_adaptive_roadmap
 
 
 # ---------------------------------------------------------------------------
@@ -51,7 +63,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="SkillGap AI API",
-    description="Resume vs Job Description Gap Analyser",
+    description="Resume vs Job Description Gap Analyser & Adaptive Learning Roadmap Engine",
     version="1.0.0",
     lifespan=lifespan,
 )
@@ -122,6 +134,18 @@ class PreferencesRequest(BaseModel):
     learning_style: str = Field("hands_on", description="hands_on | video_first | reading_docs | project_based")
     target_timeline_weeks: Optional[int] = Field(None, ge=1, description="Optional target weeks")
     user_id: Optional[str] = Field(None, description="Optional user account UUID")
+
+
+class GenerateRoadmapRequest(BaseModel):
+    weekly_hours: Optional[int] = Field(None, ge=1, le=168, description="Target study hours per week (1-168)")
+    skill_level: Optional[str] = Field(None, description="beginner | intermediate | advanced")
+    learning_style: Optional[str] = Field(None, description="hands_on | video_first | reading_docs | project_based")
+    target_timeline_weeks: Optional[int] = Field(None, ge=1, description="Optional target completion timeframe in weeks")
+
+
+class UpdateTaskRequest(BaseModel):
+    is_completed: Optional[bool] = Field(None, description="True if task is completed, False if pending")
+    notes: Optional[str] = Field(None, description="Optional personal notes or reflections")
 
 
 # ---------------------------------------------------------------------------
@@ -330,7 +354,6 @@ def update_preferences(session_id: str, payload: PreferencesRequest):
             detail=f"Invalid session UUID format: '{session_id}'."
         )
 
-    # Verify session exists
     session = get_analysis_session(session_id)
     if not session:
         raise HTTPException(
@@ -393,4 +416,227 @@ def retrieve_preferences(session_id: str):
         "success": True,
         "session_id": session_id,
         "preferences": prefs,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Phase 3: Adaptive Roadmap & Progress Tracking Endpoints
+# ---------------------------------------------------------------------------
+
+@app.post(
+    "/api/sessions/{session_id}/roadmap/generate",
+    summary="Generate Adaptive Learning Roadmap",
+    description="Generate a personalized, dependency-aware learning roadmap for missing skills.",
+)
+def generate_roadmap_for_session(
+    session_id: str,
+    payload: Optional[GenerateRoadmapRequest] = None,
+):
+    """
+    Generate an adaptive learning roadmap from the actual saved missing skills.
+    
+    1. Resolves skill dependencies and orders skills.
+    2. Breaks each skill into 5 actionable tasks with credible URLs.
+    3. Calculates adaptive duration and evaluates timeline feasibility.
+    4. Persists the roadmap and task hierarchy in SQLite.
+    """
+    if not is_valid_uuid(session_id):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid session UUID format: '{session_id}'."
+        )
+
+    session = get_analysis_session(session_id)
+    if not session:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Analysis session '{session_id}' was not found."
+        )
+
+    missing_skills = session.get("missing_skills", [])
+    if not missing_skills:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="No missing skills identified in this analysis session. The candidate already matches all required skills; no roadmap is needed."
+        )
+
+    # Resolve preferences: payload overrides stored preferences, which override defaults
+    stored_prefs = get_user_preferences(session_id) or {}
+
+    weekly_hours = stored_prefs.get("weekly_hours", 10)
+    skill_level = stored_prefs.get("skill_level", "intermediate")
+    learning_style = stored_prefs.get("learning_style", "hands_on")
+    target_timeline_weeks = stored_prefs.get("target_timeline_weeks")
+    user_id = stored_prefs.get("user_id")
+
+    if payload:
+        if payload.weekly_hours is not None:
+            weekly_hours = payload.weekly_hours
+        if payload.skill_level is not None:
+            valid_levels = {"beginner", "intermediate", "advanced"}
+            if payload.skill_level not in valid_levels:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Invalid skill_level '{payload.skill_level}'. Choose from {sorted(list(valid_levels))}."
+                )
+            skill_level = payload.skill_level
+        if payload.learning_style is not None:
+            valid_styles = {"hands_on", "video_first", "reading_docs", "project_based"}
+            if payload.learning_style not in valid_styles:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Invalid learning_style '{payload.learning_style}'. Choose from {sorted(list(valid_styles))}."
+                )
+            learning_style = payload.learning_style
+        if payload.target_timeline_weeks is not None:
+            target_timeline_weeks = payload.target_timeline_weeks
+
+    # Update preferences in database
+    save_user_preferences(
+        session_id=session_id,
+        weekly_hours=weekly_hours,
+        skill_level=skill_level,
+        learning_style=learning_style,
+        target_timeline_weeks=target_timeline_weeks,
+        user_id=user_id,
+    )
+
+    resolved_prefs = {
+        "weekly_hours": weekly_hours,
+        "skill_level": skill_level,
+        "learning_style": learning_style,
+        "target_timeline_weeks": target_timeline_weeks,
+    }
+
+    # Category lookup from taxonomy
+    cat_lookup = {item["canonical"]: item["category"] for item in get_skill_definitions()}
+
+    try:
+        roadmap_data = generate_adaptive_roadmap(session, resolved_prefs, cat_lookup)
+    except ValueError as ve:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(ve)
+        )
+
+    # Persist roadmap and tasks to SQLite
+    create_learning_roadmap(
+        session_id=session_id,
+        title=roadmap_data["title"],
+        target_role=roadmap_data["target_role"],
+        total_estimated_hours=roadmap_data["total_estimated_hours"],
+        roadmap_metadata=roadmap_data["roadmap_metadata"],
+        tasks=roadmap_data["tasks"],
+    )
+
+    saved_roadmap = get_learning_roadmap_by_session(session_id)
+    return {
+        "success": True,
+        "roadmap": saved_roadmap,
+    }
+
+
+@app.get(
+    "/api/sessions/{session_id}/roadmap",
+    summary="Get Learning Roadmap",
+    description="Retrieve the generated learning roadmap and tasks for an analysis session.",
+)
+def get_roadmap_for_session(session_id: str):
+    """Retrieve learning roadmap and actionable tasks for an analysis session."""
+    if not is_valid_uuid(session_id):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid session UUID format: '{session_id}'."
+        )
+
+    session = get_analysis_session(session_id)
+    if not session:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Analysis session '{session_id}' was not found."
+        )
+
+    roadmap = get_learning_roadmap_by_session(session_id)
+    if not roadmap:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"No learning roadmap has been generated for session '{session_id}' yet. Call POST /api/sessions/{session_id}/roadmap/generate first."
+        )
+
+    progress = get_roadmap_progress(session_id)
+    if progress:
+        roadmap["progress_summary"] = progress
+
+    return {
+        "success": True,
+        "roadmap": roadmap,
+    }
+
+
+@app.patch(
+    "/api/tasks/{task_id}",
+    summary="Update Roadmap Task Progress",
+    description="Mark a learning task as completed or pending, or update personal notes.",
+)
+def update_task_status(task_id: str, payload: UpdateTaskRequest):
+    """Update task completion status or user notes."""
+    if not is_valid_uuid(task_id):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid task UUID format: '{task_id}'."
+        )
+
+    if payload.is_completed is None and payload.notes is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="At least one field ('is_completed' or 'notes') must be provided."
+        )
+
+    updated = update_roadmap_task(
+        task_id=task_id,
+        is_completed=payload.is_completed,
+        notes=payload.notes,
+    )
+    if not updated:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Roadmap task '{task_id}' was not found."
+        )
+
+    return {
+        "success": True,
+        "task": updated,
+    }
+
+
+@app.get(
+    "/api/sessions/{session_id}/progress",
+    summary="Get Roadmap Progress Metrics",
+    description="Calculate completion percentage, completed hours, remaining hours, and dynamic timeline.",
+)
+def get_session_roadmap_progress(session_id: str):
+    """Retrieve comprehensive progress metrics for an analysis session's roadmap."""
+    if not is_valid_uuid(session_id):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid session UUID format: '{session_id}'."
+        )
+
+    session = get_analysis_session(session_id)
+    if not session:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Analysis session '{session_id}' was not found."
+        )
+
+    progress = get_roadmap_progress(session_id)
+    if not progress:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"No roadmap progress found for session '{session_id}'. Generate a roadmap first."
+        )
+
+    return {
+        "success": True,
+        "progress": progress,
     }

@@ -81,6 +81,7 @@ CREATE TABLE IF NOT EXISTS roadmap_tasks (
     is_completed INTEGER NOT NULL DEFAULT 0 CHECK (is_completed IN (0, 1)),
     completed_at TIMESTAMP,
     notes TEXT,
+    prerequisites TEXT,                -- JSON array of prerequisite skill names
     FOREIGN KEY (roadmap_id) REFERENCES learning_roadmaps(id) ON DELETE CASCADE
 );
 

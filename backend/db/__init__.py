@@ -16,6 +16,11 @@ from .repository import (
     list_analysis_sessions,
     save_user_preferences,
     get_user_preferences,
+    create_learning_roadmap,
+    get_learning_roadmap_by_session,
+    get_roadmap_task_by_id,
+    update_roadmap_task,
+    get_roadmap_progress,
 )
 
 __all__ = [
@@ -30,4 +35,9 @@ __all__ = [
     "list_analysis_sessions",
     "save_user_preferences",
     "get_user_preferences",
+    "create_learning_roadmap",
+    "get_learning_roadmap_by_session",
+    "get_roadmap_task_by_id",
+    "update_roadmap_task",
+    "get_roadmap_progress",
 ]

@@ -90,3 +90,10 @@ def init_db(db_path: Optional[str] = None, schema_file: Optional[str] = None) ->
 
     with get_db(target_path) as conn:
         conn.executescript(schema_sql)
+        # Ensure non-breaking migration for existing databases
+        cursor = conn.cursor()
+        cursor.execute("PRAGMA table_info(roadmap_tasks);")
+        cols = [r[1] for r in cursor.fetchall()]
+        if cols and "prerequisites" not in cols:
+            cursor.execute("ALTER TABLE roadmap_tasks ADD COLUMN prerequisites TEXT;")
+        cursor.close()
